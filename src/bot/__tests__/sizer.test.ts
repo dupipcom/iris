@@ -20,6 +20,7 @@ const defaultConfig: BotConfig = {
   dryRun: false,
   tradingEnabled: true,
   useLimitTpSl: false,
+  useMakerClose: false,
   logLevel: "SILENT",
   baseCurrency: "USDT",
   stateFilePath: "/tmp/test-state.json",

@@ -20,6 +20,7 @@ function makeConfig(overrides?: Partial<BotConfig>): BotConfig {
     dryRun: false,
     tradingEnabled: true,
     useLimitTpSl: false,
+    useMakerClose: false,
     logLevel: "SILENT",
     baseCurrency: "USDT",
     stateFilePath: "/tmp/test-state.json",
@@ -86,6 +87,8 @@ describe("TradeExecutor limit (maker) TP/SL mode", () => {
       submitPlanOrder: jest.fn(),
       getOrder: jest.fn(),
       getOpenPositions: jest.fn(),
+      getTicker: jest.fn(),
+      cancelOrder: jest.fn(),
     };
   });
 
@@ -169,5 +172,89 @@ describe("TradeExecutor limit (maker) TP/SL mode", () => {
     expect(reqs[3].takeProfitPrice).toBeUndefined();
     expect(reqs[4]).toMatchObject({ takeProfitType: 1 });
     expect(reqs[4].takeProfitPrice).toBeUndefined();
+  });
+});
+
+describe("TradeExecutor maker (limit) close mode", () => {
+  let client: any;
+
+  beforeEach(() => {
+    client = {
+      submitOrder: jest.fn(),
+      submitStopOrder: jest.fn(),
+      submitPlanOrder: jest.fn(),
+      getOrder: jest.fn(),
+      getOpenPositions: jest.fn(),
+      getTicker: jest.fn(),
+      cancelOrder: jest.fn(),
+    };
+  });
+
+  const position = { positionId: 999, holdVol: 1, openType: 1, leverage: 10 } as any;
+
+  it("closes with a Post-Only limit (maker) order at the touch when USE_MAKER_CLOSE is on", async () => {
+    client.getTicker.mockResolvedValue({
+      success: true, code: 0,
+      data: { lastPrice: 66000, bid1: 65950, ask1: 66050 },
+    });
+    client.submitOrder.mockResolvedValue({ success: true, code: 0, data: "maker-1" });
+    client.getOrder.mockResolvedValue({
+      success: true, code: 0,
+      data: { orderId: "maker-1", dealVol: 1, vol: 1, state: 3 },
+    });
+
+    const executor = new TradeExecutor(client, makeConfig({ useMakerClose: true }), logger);
+    const result = await executor.closePosition(
+      "BTC_USDT", position, 66000, 1, 1, 10, 100, 3, 0.001, 0.1
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.orderId).toBe("maker-1");
+    // Post-Only limit at bid1 + priceUnit, reduce-only, tied to the position.
+    const makerParams = client.submitOrder.mock.calls[0][0];
+    expect(makerParams.type).toBe(2);
+    expect(makerParams.price).toBe(65950 + 0.1);
+    expect(makerParams.reduceOnly).toBe(true);
+    expect(makerParams.positionId).toBe(999);
+    expect(client.submitOrder).toHaveBeenCalledTimes(1);
+    expect(client.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it("uses a plain market close when USE_MAKER_CLOSE is off", async () => {
+    client.submitOrder.mockResolvedValue({ success: true, code: 0, data: "mkt-1" });
+
+    const executor = new TradeExecutor(client, makeConfig({ useMakerClose: false }), logger);
+    const result = await executor.closePosition(
+      "BTC_USDT", position, 66000, 1, 1, 10, 100, 3, 0.001, 0.1
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.orderId).toBe("mkt-1");
+    const params = client.submitOrder.mock.calls[0][0];
+    expect(params.type).toBe(5);
+    expect(params.reduceOnly).toBe(true);
+    expect(params.positionId).toBe(999);
+    expect(client.getTicker).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a market close when the Post-Only maker close is rejected", async () => {
+    client.getTicker.mockResolvedValue({
+      success: true, code: 0,
+      data: { lastPrice: 66000, bid1: 65950, ask1: 66050 },
+    });
+    client.submitOrder
+      .mockResolvedValueOnce({ success: false, code: 999, message: "post only rejected" })
+      .mockResolvedValueOnce({ success: true, code: 0, data: "mkt-1" });
+
+    const executor = new TradeExecutor(client, makeConfig({ useMakerClose: true }), logger);
+    const result = await executor.closePosition(
+      "BTC_USDT", position, 66000, 1, 1, 10, 100, 3, 0.001, 0.1
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.orderId).toBe("mkt-1");
+    const [makerParams, mktParams] = client.submitOrder.mock.calls.map((c: any[]) => c[0]);
+    expect(makerParams.type).toBe(2); // Post-Only attempt
+    expect(mktParams.type).toBe(5);   // market fallback
   });
 });

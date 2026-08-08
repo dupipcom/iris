@@ -943,7 +943,8 @@ export class SignalBot {
       position.leverage,
       pct,
       contract?.volScale,
-      contract?.volUnit
+      contract?.volUnit,
+      contract?.priceUnit
     );
 
     if (result.success) {
@@ -1137,7 +1138,7 @@ export class SignalBot {
     // 6. Close the position fully (100%).
     const closeResult = await this.executor.closePosition(
       symbol, position, currentPrice, positionType, position.openType, position.leverage, 100,
-      contract?.volScale, contract?.volUnit
+      contract?.volScale, contract?.volUnit, contract?.priceUnit
     );
     if (!closeResult.success) {
       await this.sendReverseResult({

@@ -144,6 +144,7 @@ All settings are environment variables. Copy `.env.example` and fill in:
 | `MAX_CONCURRENT_TRADES` | `5` | Max simultaneous open positions |
 | `MAX_NOTIONAL_PER_TRADE` | `10000` | Max USDT notional value per trade |
 | `USE_LIMIT_TP_SL` | `false` | Place TP/SL as **Limit (Maker)** Stop-Limit orders (0% maker fee) instead of market (taker) TP/SL. Applies to market entries; plan/stop entries keep market TP/SL (a warning is logged) |
+| `USE_MAKER_CLOSE` | `false` | Close positions with **Limit (Maker)** orders at the best bid/ask instead of market (taker) orders — maker fills pay the maker fee (often 0%) instead of taker (0.05%). Falls back to a market close after ~2.5s if the maker order hasn't filled |
 | **Safety** | | |
 | `DRY_RUN` | `true` | Parse & size, but don't submit orders |
 | `TRADING_ENABLED` | `true` | Master trading on/off switch |

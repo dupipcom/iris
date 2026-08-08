@@ -107,6 +107,13 @@ export function loadConfig(): BotConfig {
   const useLimitTpSl =
     env.USE_LIMIT_TP_SL === "true" || env.USE_LIMIT_TP_SL === "1";
 
+  // Close with LIMIT (maker) orders instead of market (taker) orders. Maker
+  // fills pay the maker fee (often 0% on MEXC) instead of the taker fee, but
+  // are not guaranteed to fill instantly — so the bot waits a short grace
+  // period and then falls back to a market close.
+  const useMakerClose =
+    env.USE_MAKER_CLOSE === "true" || env.USE_MAKER_CLOSE === "1";
+
   const logLevel = (
     (env.LOG_LEVEL || "INFO").toUpperCase() as BotConfig["logLevel"]
   );
@@ -192,6 +199,7 @@ export function loadConfig(): BotConfig {
     dryRun,
     tradingEnabled,
     useLimitTpSl,
+    useMakerClose,
     logLevel,
     baseCurrency,
     stateFilePath,

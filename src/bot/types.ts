@@ -154,6 +154,14 @@ export interface BotConfig {
    */
   useLimitTpSl: boolean;
 
+  /**
+   * Close positions with LIMIT (maker) orders instead of market (taker) orders.
+   * When enabled, manual/reverse closes first try a Post-Only limit close at the
+   * best bid/ask (maker fee, often 0%); if it doesn't fill within a short grace
+   * period it's cancelled and a market close is used as fallback.
+   */
+  useMakerClose: boolean;
+
   /** Log level */
   logLevel: "SILENT" | "ERROR" | "WARN" | "INFO" | "DEBUG";
 

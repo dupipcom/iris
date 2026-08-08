@@ -7,6 +7,14 @@ import { Logger } from "../utils/logger";
 import { fibonacciTpDistribution } from "./config";
 
 /**
+ * How long (ms) to wait for a maker (limit) close order to fill before
+ * cancelling it and falling back to a market close. Trade-off: longer gives the
+ * maker order more time to fill at 0%/low maker fees, but risks the position
+ * staying open longer on a fast market.
+ */
+const MAKER_CLOSE_GRACE_MS = 2500;
+
+/**
  * Details of a plan (trigger) order that was placed WITHOUT attached TP/SL.
  * When the plan triggers and the position opens, the bot calls
  * {@link TradeExecutor.placeDeferredLimitTpSl} to attach limit (maker) TP/SL.
@@ -127,6 +135,7 @@ export class TradeExecutor {
    * @param closePercent Percentage of the position to close (1–100, default 100 = full close)
    * @param volScale Volume decimal places for this contract (0 = integer), defaults to 8 as safety
    * @param volUnit Volume step unit for this contract (e.g. 0.01), defaults to 1e-8 as safety
+   * @param priceUnit Price step unit (tick) for this contract — required for maker closes (e.g. 0.01)
    */
   async closePosition(
     symbol: string,
@@ -137,7 +146,8 @@ export class TradeExecutor {
     leverage: number,
     closePercent: number = 100,
     volScale?: number,
-    volUnit?: number
+    volUnit?: number,
+    priceUnit?: number
   ): Promise<{ success: boolean; orderId?: string; volume?: number; error?: string }> {
     // Calculate the volume to close, respecting the percentage and contract precision.
     const rawVol = position.holdVol * (closePercent / 100);
@@ -184,12 +194,91 @@ export class TradeExecutor {
     // side 4 = close long, side 2 = close short (see types/orders.ts)
     const side = positionType === 1 ? 4 : 2;
 
-    const params: SubmitOrderRequest = {
+    // Preferred: close as a LIMIT (maker) order at the touch so the exit pays the
+    // maker fee (0.02% — and often 0% during MEXC promos) instead of the taker
+    // fee (0.05%) of a market close. Falls back to market if it doesn't fill in time.
+    if (this.config.useMakerClose && priceUnit && priceUnit > 0) {
+      const makerResult = await this.tryMakerClose(
+        symbol,
+        position,
+        closeVol,
+        side,
+        openType,
+        leverage,
+        priceUnit,
+        currentPrice
+      );
+      if (makerResult) return makerResult;
+    }
+
+    // Market (taker) close — guaranteed fill, pays taker fees.
+    return this.submitMarketClose(
+      {
+        symbol,
+        price: currentPrice || 0,
+        vol: closeVol,
+        side,
+        type: 5, // market
+        openType,
+        leverage,
+        reduceOnly: true,
+        positionId: position.positionId,
+      },
+      closeVol
+    );
+  }
+
+  /**
+   * Attempt a LIMIT (maker) close at the touch, falling back to a market close.
+   *
+   * MEXC has no separate "close position" endpoint — closing is always an
+   * opposite reduce-only order, and the fee depends on maker vs taker. A market
+   * close (type 5) is always a taker fill (taker fee). Posting a limit close at
+   * the passive touch (type 2, Post Only) makes it a maker fill (maker fee, often
+   * 0%). We poll briefly for a fill; if it doesn't fill in time we cancel it and
+   * market-close the remainder so the position is never left open.
+   *
+   * Returns a result when a close was actually placed (maker or market fallback),
+   * or null when the maker path isn't applicable (no ticker/priceUnit) — in which
+   * case the caller does a plain market close.
+   */
+  private async tryMakerClose(
+    symbol: string,
+    position: Position,
+    closeVol: number,
+    side: 4 | 2,
+    openType: 1 | 2,
+    leverage: number,
+    priceUnit: number,
+    currentPrice: number
+  ): Promise<{ success: boolean; orderId?: string; volume?: number; error?: string } | null> {
+    // Best bid/ask — used to derive a passive (maker) price.
+    let bid1 = 0;
+    let ask1 = 0;
+    try {
+      const ticker = await this.client.getTicker(symbol);
+      bid1 = ticker?.data?.bid1 ?? 0;
+      ask1 = ticker?.data?.ask1 ?? 0;
+    } catch {
+      this.logger.warn(`⚠️ USE_MAKER_CLOSE: no ticker for ${symbol} — using market close`);
+      return null;
+    }
+    if (bid1 <= 0 || ask1 <= 0) {
+      this.logger.warn(`⚠️ USE_MAKER_CLOSE: bad ticker for ${symbol} — using market close`);
+      return null;
+    }
+
+    // Close LONG (sell) → post one tick above the best bid (passive maker).
+    // Close SHORT (buy) → post one tick below the best ask (passive maker).
+    const makerPrice = side === 4 ? bid1 + priceUnit : ask1 - priceUnit;
+    if (makerPrice <= 0) return null;
+
+    const makerParams: SubmitOrderRequest = {
       symbol,
-      price: currentPrice || 0,
+      price: makerPrice,
       vol: closeVol,
       side,
-      type: 5, // market
+      type: 2, // Post Only (maker) — MEXC rejects it if it would cross the book
       openType,
       leverage,
       reduceOnly: true,
@@ -198,13 +287,89 @@ export class TradeExecutor {
 
     try {
       this.logger.info(
-        `🔚 Closing position: ${symbol} ${positionType === 1 ? "LONG" : "SHORT"} vol=${closeVol} side=${side}`
+        `🎯 Maker close: ${symbol} ${side === 4 ? "LONG" : "SHORT"} vol=${closeVol} @ ${makerPrice} (Post-Only)`
+      );
+      const response = await this.client.submitOrder(makerParams);
+      if (!response.success) {
+        this.logger.warn(
+          `⚠️ Maker close rejected for ${symbol}: ${response.message || `Code ${response.code}`} — using market close`
+        );
+        return null;
+      }
+      const makerOid = String(response.data ?? "");
+      this.logger.info(`✅ Maker close order placed: ${makerOid} for ${symbol}`);
+
+      // Poll for a fill (Post-Only orders sit on the book and fill as maker).
+      const deadline = Date.now() + MAKER_CLOSE_GRACE_MS;
+      let dealVol = 0;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250));
+        try {
+          const ord = (await this.client.getOrder(makerOid)) as any;
+          const data = ord?.data ?? ord;
+          dealVol = Number(data?.dealVol ?? 0);
+          const state = Number(data?.state ?? 0);
+          // 3 = completed. A full fill is done regardless of state.
+          if (state === 3 || dealVol >= closeVol) {
+            this.logger.info(`✅ Maker close filled for ${symbol}: ${makerOid} vol=${dealVol}`);
+            return { success: true, orderId: makerOid, volume: dealVol };
+          }
+          if (state === 4 || state === 5) break; // cancelled / invalid → fall back
+        } catch {
+          // keep polling
+        }
+      }
+
+      // Not filled in time → cancel the maker order and market-close the remainder.
+      try {
+        await this.client.cancelOrder([makerOid]);
+      } catch {
+        // best-effort cancel
+      }
+      const remaining = Math.max(0, closeVol - dealVol);
+      this.logger.warn(
+        `⏱️ Maker close ${makerOid} not filled in time for ${symbol} — market-close remainder vol=${remaining}`
+      );
+      if (remaining <= 0) {
+        return { success: true, orderId: makerOid, volume: dealVol };
+      }
+      return this.submitMarketClose(
+        {
+          symbol,
+          price: currentPrice || 0,
+          vol: remaining,
+          side,
+          type: 5,
+          openType,
+          leverage,
+          reduceOnly: true,
+          positionId: position.positionId,
+        },
+        remaining
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.logger.error(`❌ Maker close failed for ${symbol}: ${msg} — using market close`);
+      return null;
+    }
+  }
+
+  /**
+   * Submit a market (taker) close order and log the outcome.
+   */
+  private async submitMarketClose(
+    params: SubmitOrderRequest,
+    volume: number
+  ): Promise<{ success: boolean; orderId?: string; volume?: number; error?: string }> {
+    try {
+      this.logger.info(
+        `🔚 Closing position: ${params.symbol} ${params.side === 4 ? "LONG" : "SHORT"} vol=${volume} side=${params.side}`
       );
       const response = await this.client.submitOrder(params);
       if (response.success) {
         const oid = String(response.data ?? "");
-        this.logger.info(`✅ Close order placed: ${oid} for ${symbol}`);
-        return { success: true, orderId: oid, volume: closeVol };
+        this.logger.info(`✅ Close order placed: ${oid} for ${params.symbol}`);
+        return { success: true, orderId: oid, volume };
       }
       return {
         success: false,
@@ -212,7 +377,7 @@ export class TradeExecutor {
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`❌ Close order failed for ${symbol}: ${msg}`);
+      this.logger.error(`❌ Close order failed for ${params.symbol}: ${msg}`);
       return { success: false, error: msg };
     }
   }

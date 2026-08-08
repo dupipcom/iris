@@ -148,6 +148,13 @@
             </select>
           </div>
           <div class="field">
+            <label for="USE_MAKER_CLOSE">Maker Closes <small>(close positions with limit orders — 0% maker fee)</small></label>
+            <select id="USE_MAKER_CLOSE">
+              <option value="false">Off (Market close)</option>
+              <option value="true">On (Limit / Maker close)</option>
+            </select>
+          </div>
+          <div class="field">
             <label for="SPLIT_MULTI_TP">Partial Close TPs <small>(split position across TP levels; single TP if off)</small></label>
             <select id="SPLIT_MULTI_TP">
               <option value="false">Off (single TP)</option>
