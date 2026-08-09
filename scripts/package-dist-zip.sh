@@ -12,7 +12,7 @@ if [ ! -d dist ]; then
   echo "❌ dist/ not found — run 'npm run build' first." >&2
   exit 1
 fi
-
+npm run build
 rm -f dist.zip
 zip -rq dist.zip dist
 
