@@ -111,7 +111,7 @@ export interface SlTpEntry {
   symbol?: string;
   /** Stop-loss price */
   sl: number;
-  /** Take-profit price (nearest target for multi-TP signals) */
+  /** Take-profit price (nearest target for multi-TP signals, or furthest target when splitMultiTp is disabled) */
   tp: number;
   /** Position direction: 1 = long, 2 = short */
   positionType: 1 | 2;
@@ -119,6 +119,14 @@ export interface SlTpEntry {
   setAt: number;
   /** Fill order ID — use this for CLOSE / REVERSE / ADD TO commands. */
   orderId?: string;
+  /**
+   * All TP targets for this position, sorted closest-to-furthest from entry.
+   * When splitMultiTp is disabled, the monitor uses this to detect
+   * intermediate TP hits and trigger partial closes. The last element is the
+   * TP actually attached to the order (furthest target). Empty/non-existent
+   * for single-TP signals or when multi-TP splitting is enabled.
+   */
+  allTpTargets?: number[];
 }
 
 /** Entry accepted by `set(symbol, positionType, entry)` — direction/symbol added internally. */

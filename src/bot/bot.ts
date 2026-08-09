@@ -23,6 +23,7 @@ import {
   PositionSummaryMonitor,
   PositionSummary,
   PositionAlert,
+  PartialTpHit,
 } from "./summaryMonitor";
 import { formatPositionSummaryMessage } from "./summaryMessage";
 import { formatOrderPlacedMessage } from "./orderMessage";
@@ -32,6 +33,7 @@ import { formatCancelOrdersMessage, CancelOrdersResult } from "./cancelMessage";
 import { formatReverseMessage, ReverseResult, formatAddToMessage, AddToResult } from "./reverseAddMessage";
 import { formatTradeConfirmationMessage } from "./confirmationMessage";
 import { SlTpStore } from "./slTpStore";
+import { fibonacciTpDistribution } from "./config";
 import { Position } from "../types/account";
 import { GetOrderResponse, PlanOrderListResponse } from "../types/orders";
 import { ContractDetail } from "../types/market";
@@ -151,6 +153,7 @@ export class SignalBot {
       onSummary: (summary) => this.sendPositionSummary(summary),
       slTpStore: this.slTpStore,
       onAlert: (alert) => this.sendPositionAlert(alert),
+      onPartialTpHit: (hit) => { void this.handlePartialTpHit(hit); },
       slTpRetentionDays: config.logRetentionDays,
       onSample: (positions) => this.pnlMonitor?.feedPositions(positions),
       requestSpacingMs: config.orderRateIntervalMs,
@@ -665,23 +668,38 @@ export class SignalBot {
   /**
    * Store the SL/TP levels from a successfully placed trade so the summary
    * monitor can evaluate >50%-of-way alerts for the resulting position.
+   *
+   * When splitMultiTp is disabled and the signal has multiple TP targets,
+   * we store ALL targets so the monitor can detect intermediate TP hits
+   * and trigger partial closes. The `tp` field gets the furthest target
+   * (the one actually attached to the order).
    */
   private registerSlTp(record: TradeRecord): void {
     const t = record.resolved;
-    // Nearest TP: first target for the direction (lowest for LONG, highest for SHORT).
     const tps =
       t.allTpTargets.length > 0 ? t.allTpTargets : [t.takeProfitPrice];
+
+    // Nearest TP: first target for the direction (lowest for LONG, highest for SHORT)
     const nearestTp =
       t.side === 1 ? Math.min(...tps) : Math.max(...tps);
 
+    // When splitMultiTp is disabled and there are multiple TPs, the order
+    // was placed with the furthest TP — store ALL targets for partial-close tracking.
+    const hasMultiTpDisabled = tps.length > 1 && !this.config.splitMultiTp;
+    const storedTp = hasMultiTpDisabled
+      ? tps[tps.length - 1]  // furthest TP (the one on the order)
+      : nearestTp;
+
     this.slTpStore.set(t.mexcSymbol, t.side === 1 ? 1 : 2, {
       sl: t.stopLossPrice,
-      tp: nearestTp,
+      tp: storedTp,
       setAt: Date.now(),
       orderId: record.orderId,
+      allTpTargets: hasMultiTpDisabled ? [...tps] : undefined,
     });
     this.logger.info(
-      `💾 SL/TP stored for ${t.mexcSymbol}: SL=${t.stopLossPrice} TP=${nearestTp} orderId=${record.orderId}`
+      `💾 SL/TP stored for ${t.mexcSymbol}: SL=${t.stopLossPrice} TP=${storedTp} orderId=${record.orderId}` +
+      (hasMultiTpDisabled ? ` (multi-TP partial-close tracking: ${tps.join(", ")})` : "")
     );
   }
 
@@ -978,6 +996,157 @@ export class SignalBot {
         queriedId: orderId,
         symbol,
         error: result.error,
+      });
+    }
+  }
+
+  /**
+   * Handle an intermediate TP hit detected by the summary monitor.
+   * Partially closes the position using the fibonacci weight for the
+   * hit TP level, then updates the slTpStore to track remaining TPs.
+   */
+  private async handlePartialTpHit(hit: PartialTpHit): Promise<void> {
+    if (!this.config.tradingEnabled) {
+      this.logger.info(
+        `🎯 Partial TP hit IGNORED (trading disabled): ${hit.symbol} TP=${hit.tpPrice}`
+      );
+      return;
+    }
+    if (this.config.dryRun) {
+      this.logger.info(
+        `🧪 [DRY RUN] Would partially close ${hit.symbol} at TP=${hit.tpPrice}`
+      );
+      return;
+    }
+
+    // Resolve the position from the summary monitor's active list.
+    let position: Position | undefined;
+    try {
+      const res = await this.mexcClient.getOpenPositions();
+      const positions: Position[] = Array.isArray(res.data) ? res.data : [];
+      position = positions.find(
+        (p) => String(p.positionId) === hit.positionId && p.holdVol > 0
+      );
+    } catch (error) {
+      this.logger.error(
+        `❌ Failed to fetch position for partial TP close: ${hit.symbol}`,
+        error instanceof Error ? error.message : error
+      );
+      return;
+    }
+    if (!position) {
+      this.logger.warn(
+        `⚠️ Position ${hit.positionId} (${hit.symbol}) no longer open — skipping partial TP close`
+      );
+      return;
+    }
+
+    // Compute the fibonacci weights for the ORIGINAL TP count.
+    const weights = fibonacciTpDistribution(hit.totalTpCount);
+    // The weight for THIS TP as a percentage of the original position.
+    const tpWeight = weights[hit.tpIndex] ?? 0;
+    // Remaining weights for this TP and all subsequent TPs.
+    const remainingWeight = weights.slice(hit.tpIndex).reduce((a, b) => a + b, 0);
+    // Close percentage of the CURRENT position.
+    const closePercent = remainingWeight > 0
+      ? Math.min(100, Math.max(1, Math.round((tpWeight / remainingWeight) * 100)))
+      : 100;
+
+    this.logger.info(
+      `🎯 Partial TP close: ${hit.symbol} ${hit.positionType === 1 ? "LONG" : "SHORT"} ` +
+      `TP${hit.tpIndex + 1}=${hit.tpPrice} hit → closing ~${closePercent}% ` +
+      `(fib weight ${tpWeight}/${remainingWeight}), ` +
+      `${hit.remainingTpTargets.length} TP(s) remaining`
+    );
+
+    // Resolve contract for vol precision.
+    await this.resolver.refreshIfNeeded();
+    const contract = await this.resolver.resolve(hit.symbol);
+
+    // Get current price for the close order.
+    let currentPrice = hit.currentPrice;
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+      try {
+        const ticker = await this.mexcClient.getTicker(hit.symbol);
+        currentPrice = ticker?.data?.lastPrice ?? 0;
+      } catch {
+        currentPrice = 0;
+      }
+    }
+
+    // Execute partial close.
+    const result = await this.executor.closePosition(
+      hit.symbol,
+      position,
+      currentPrice,
+      hit.positionType,
+      position.openType,
+      position.leverage,
+      closePercent,
+      contract?.volScale,
+      contract?.volUnit,
+      contract?.priceUnit
+    );
+
+    if (result.success) {
+      // Update slTpStore: remove the hit TP from the list.
+      // The remaining TPs are the ones still ahead (higher indices).
+      const entry = this.slTpStore.get(hit.symbol, hit.positionType);
+      if (entry && entry.allTpTargets) {
+        const remaining = entry.allTpTargets.slice(hit.tpIndex + 1);
+        if (remaining.length > 0) {
+          // Update store with remaining TPs. The furthest remaining TP
+          // becomes the new primary TP for alert calculations.
+          const furthestRemaining = remaining[remaining.length - 1];
+          this.slTpStore.set(hit.symbol, hit.positionType, {
+            sl: entry.sl,
+            tp: furthestRemaining,
+            setAt: Date.now(),
+            orderId: entry.orderId,
+            allTpTargets: remaining.length > 1 ? remaining : undefined,
+          });
+          this.logger.info(
+            `💾 SL/TP updated for ${hit.symbol}: TP now ${furthestRemaining}, ` +
+            `${remaining.length} TP(s) remaining`
+          );
+        } else {
+          // Only the furthest TP remains — no more partial closes needed.
+          // Keep the entry but clear allTpTargets since there's only 1 TP left.
+          this.slTpStore.set(hit.symbol, hit.positionType, {
+            sl: entry.sl,
+            tp: entry.tp,
+            setAt: Date.now(),
+            orderId: entry.orderId,
+            allTpTargets: undefined,
+          });
+          this.logger.info(
+            `💾 SL/TP updated for ${hit.symbol}: only furthest TP=${entry.tp} remains`
+          );
+        }
+      }
+
+      // Notify the operator.
+      await this.sendCloseResult({
+        status: "success",
+        queriedId: hit.positionId,
+        symbol: hit.symbol,
+        positionType: hit.positionType,
+        leverage: position.leverage,
+        volume: result.volume,
+        price: currentPrice || undefined,
+        orderId: result.orderId,
+        closePercent: closePercent,
+        currency: this.config.baseCurrency,
+      });
+    } else {
+      this.logger.error(
+        `❌ Partial TP close FAILED for ${hit.symbol}: ${result.error ?? "unknown error"}`
+      );
+      await this.sendCloseResult({
+        status: "error",
+        queriedId: hit.positionId,
+        symbol: hit.symbol,
+        error: result.error ?? "Partial close order failed",
       });
     }
   }

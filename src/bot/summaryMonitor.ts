@@ -168,6 +168,31 @@ export interface PositionSummary {
   dailyPnl: DailyPnlInfo;
 }
 
+/**
+ * An alert fired while sampling when an open position's current price has
+ * crossed an intermediate take-profit target (not the furthest one). The
+ * handler should partially close the position at that TP level.
+ */
+export interface PartialTpHit {
+  positionId: string;
+  symbol: string;
+  positionType: 1 | 2; // 1 = long, 2 = short
+  /** The TP price that was crossed */
+  tpPrice: number;
+  /** Current market price derived from unrealized PNL */
+  currentPrice: number;
+  /** All remaining TP targets (including the one just hit). */
+  remainingTpTargets: number[];
+  /** Index (0-based) of the hit TP within the original allTpTargets array. */
+  tpIndex: number;
+  /** Total number of TP targets originally. */
+  totalTpCount: number;
+  /** Fill order ID for the position. */
+  orderId?: string;
+}
+
+export type OnPartialTpHit = (hit: PartialTpHit) => void;
+
 export type OnPositionSummary = (summary: PositionSummary) => void;
 
 export type OnPositionAlert = (alert: PositionAlert) => void;
@@ -188,6 +213,13 @@ export interface PositionSummaryMonitorOptions {
   slTpStore: SlTpStore;
   /** Called once per position per target when >50% of the way toward SL/TP. */
   onAlert: OnPositionAlert;
+  /**
+   * Called when an intermediate TP target is crossed (price beyond the TP
+   * level). Only fires for multi-TP signals placed with splitMultiTp disabled,
+   * where the order uses the furthest TP and the monitor handles partial
+   * closes at intermediate targets.
+   */
+  onPartialTpHit?: OnPartialTpHit;
   /** Days after which stale SL/TP entries are pruned (default LOG_RETENTION_DAYS). */
   slTpRetentionDays: number;
   /**
@@ -232,6 +264,7 @@ export class PositionSummaryMonitor {
   private slTpStore: SlTpStore;
   private slTpRetentionMs: number;
   private onAlert: OnPositionAlert;
+  private onPartialTpHit: OnPartialTpHit | undefined;
   private onSample: ((positions: Position[]) => void) | undefined;
   private onNewPosition: ((positions: Position[]) => void) | undefined;
   private requestSpacingMs: number;
@@ -243,6 +276,11 @@ export class PositionSummaryMonitor {
   private sampling = false;
   /** Tracks which positions already alerted per target, to avoid repeat alerts. */
   private alerted = new Map<string, { sl: boolean; tp: boolean }>();
+  /**
+   * Tracks which TP targets have already triggered a partial close.
+   * Key: `${symbol}:${positionType}`, value: set of TP prices already hit.
+   */
+  private partialTpHit = new Map<string, Set<number>>();
   /** Previous unrealized PNL per position, used to compute per-poll deltas for console ticker logging. */
   private prevPnl = new Map<string, number>();
   private pendingOrdersCache: { orders: PendingOrderSummary[]; ts: number } | null = null;
@@ -263,6 +301,7 @@ export class PositionSummaryMonitor {
     this.onSummary = opts.onSummary;
     this.slTpStore = opts.slTpStore;
     this.onAlert = opts.onAlert;
+    this.onPartialTpHit = opts.onPartialTpHit;
     this.onSample = opts.onSample;
     this.onNewPosition = opts.onNewPosition;
     this.requestSpacingMs = Math.max(0, opts.requestSpacingMs ?? 0);
@@ -440,6 +479,7 @@ export class PositionSummaryMonitor {
       this.slTpStore.pruneStale(this.slTpRetentionMs);
       await this.ensureContractSizes(active);
       await this.checkAlerts(active);
+      await this.checkPartialTpHits(active);
     } catch (error) {
       this.logger.warn(
         "⚠️ Position summary sampling failed:",
@@ -1346,6 +1386,72 @@ export class PositionSummaryMonitor {
       pnl: Number.isFinite(mexcPnl) ? mexcPnl : 0,
       computedPnl,
     };
+  }
+
+  /**
+   * Check whether an open position's current price has crossed any
+   * intermediate TP targets. Only fires when the slTpStore entry includes
+   * `allTpTargets` (multi-TP signal placed with splitMultiTp disabled).
+   *
+   * For each intermediate TP (all except the last/furthest one), if the
+   * current price has crossed the TP level, the `onPartialTpHit` callback
+   * is invoked exactly once per TP per position lifetime.
+   */
+  private checkPartialTpHits(active: Position[]): void {
+    if (!this.onPartialTpHit) return;
+
+    const seen = new Set<string>();
+    for (const p of active) {
+      const key = `${p.symbol}:${p.positionType}`;
+      seen.add(key);
+      const entry = this.slTpStore.get(p.symbol, p.positionType);
+      if (!entry || !entry.allTpTargets || entry.allTpTargets.length <= 1) continue;
+
+      const allTps = entry.allTpTargets;
+      const isLong = p.positionType === 1;
+      const current = this.deriveCurrentPrice(p);
+      if (!Number.isFinite(current) || current <= 0) continue;
+
+      const hitSet = this.partialTpHit.get(key) ?? new Set<number>();
+
+      // Check each intermediate TP (all except the last/furthest one).
+      for (let i = 0; i < allTps.length - 1; i++) {
+        const tpPrice = allTps[i];
+        if (hitSet.has(tpPrice)) continue; // already handled
+
+        const crossed = isLong
+          ? current >= tpPrice   // LONG: price rose above TP
+          : current <= tpPrice;  // SHORT: price fell below TP
+
+        if (crossed) {
+          hitSet.add(tpPrice);
+          this.partialTpHit.set(key, hitSet);
+
+          this.logger.info(
+            `🎯 Intermediate TP hit: ${p.symbol} ${isLong ? "LONG" : "SHORT"} ` +
+            `TP${i + 1}=${tpPrice} crossed (current=${current}), ` +
+            `${allTps.length - i - 1} TP(s) remaining`
+          );
+
+          this.onPartialTpHit({
+            positionId: String(p.positionId),
+            symbol: p.symbol,
+            positionType: p.positionType,
+            tpPrice,
+            currentPrice: current,
+            remainingTpTargets: allTps.slice(i + 1), // TPs still ahead
+            tpIndex: i,
+            totalTpCount: allTps.length,
+            orderId: entry.orderId,
+          });
+        }
+      }
+    }
+
+    // Clean up hit tracking for positions no longer open.
+    for (const key of Array.from(this.partialTpHit.keys())) {
+      if (!seen.has(key)) this.partialTpHit.delete(key);
+    }
   }
 
   /**

@@ -416,9 +416,18 @@ export class TradeExecutor {
     // Single TP, or splitting disabled → one order with all volume.
     if (trade.allTpTargets.length <= 1 || !this.config.splitMultiTp) {
       if (trade.allTpTargets.length > 1 && !this.config.splitMultiTp) {
+        // Use the HIGHEST (furthest) TP target as the order TP — the monitor
+        // will detect intermediate TP hits and partially close the position
+        // as those levels are reached.
+        const furthestTp = trade.allTpTargets[trade.allTpTargets.length - 1];
         this.logger.info(
-          `📎 Signal has ${trade.allTpTargets.length} TP targets but SPLIT_MULTI_TP is disabled — using TP1=${trade.takeProfitPrice} only, single order`
+          `📎 Signal has ${trade.allTpTargets.length} TP targets but SPLIT_MULTI_TP is disabled — ` +
+          `using furthest TP=${furthestTp} for the order; monitor will handle partial closes at intermediate TPs`
         );
+        const record = await this.submitSingleOrder(trade, trade.volume, furthestTp, isTrigger);
+        records.push(record);
+        this.logTradeRecord(record);
+        return records;
       }
       const record = await this.submitSingleOrder(trade, trade.volume, trade.takeProfitPrice, isTrigger);
       records.push(record);
