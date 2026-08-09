@@ -166,6 +166,12 @@ export function loadConfig(): BotConfig {
   const splitMultiTp =
     env.SPLIT_MULTI_TP === "true" || env.SPLIT_MULTI_TP === "1";
 
+  // Trailing stop on TP hits: when splitMultiTp is disabled and an
+  // intermediate TP is hit, the stop-loss moves to the previous level
+  // (TP1 → SL=entry, TP2 → SL=TP1, etc.). Default false.
+  const trailingStopOnTp =
+    env.TRAILING_STOP_ON_TP === "true" || env.TRAILING_STOP_ON_TP === "1";
+
   // TP volume distribution: comma-separated percentages (e.g. "60,30,10").
   // When not set, Fibonacci-based defaults are computed at execution time
   // based on the number of TP levels in the signal.
@@ -216,6 +222,7 @@ export function loadConfig(): BotConfig {
     signalResolverIntervalSeconds,
     splitMultiTp,
     tpDistribution,
+    trailingStopOnTp,
   };
 
   validate(config);

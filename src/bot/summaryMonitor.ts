@@ -479,7 +479,6 @@ export class PositionSummaryMonitor {
       this.slTpStore.pruneStale(this.slTpRetentionMs);
       await this.ensureContractSizes(active);
       await this.checkAlerts(active);
-      await this.checkPartialTpHits(active);
     } catch (error) {
       this.logger.warn(
         "⚠️ Position summary sampling failed:",
@@ -1238,7 +1237,11 @@ export class PositionSummaryMonitor {
   /**
    * For each open position with a known SL/TP entry, evaluate whether the
    * price has moved more than 50% of the way toward the stop-loss or
-   * take-profit level. Fires at most once per target per position lifetime.
+   * take-profit level, AND check for intermediate TP crossings (when
+   * allTpTargets is present — multi-TP with split disabled).
+   *
+   * >50% alerts fire at most once per target per position lifetime.
+   * Intermediate TP crossings fire exactly once per TP per position.
    */
   private async checkAlerts(active: Position[]): Promise<void> {
     // Prefer the in-memory slTpStore; only fetch pending TP/SL stop orders to
@@ -1263,25 +1266,34 @@ export class PositionSummaryMonitor {
       const entry = lookup.get(`${p.symbol}:${p.positionType}`);
       if (!entry) continue;
 
+      // ── >50% toward SL/TP alert ──
       const alert = this.evaluateAlert(p, entry);
-      if (!alert) continue;
+      if (alert) {
+        const key = alert.target.toLowerCase() as "sl" | "tp";
+        const flags = this.alerted.get(id);
+        if (!flags || !flags[key]) {
+          this.alerted.set(id, {
+            sl: flags?.sl || key === "sl",
+            tp: flags?.tp || key === "tp",
+          });
+          this.logger.info(
+            `🚨 ${alert.target} alert: ${p.symbol} ${Math.round(alert.progress * 100)}% of the way`
+          );
+          this.onAlert(alert);
+        }
+      }
 
-      const key = alert.target.toLowerCase() as "sl" | "tp";
-      const flags = this.alerted.get(id);
-      if (flags && flags[key]) continue; // already alerted for this target
-
-      this.alerted.set(id, {
-        sl: flags?.sl || key === "sl",
-        tp: flags?.tp || key === "tp",
-      });
-      this.logger.info(
-        `🚨 ${alert.target} alert: ${p.symbol} ${Math.round(alert.progress * 100)}% of the way`
-      );
-      this.onAlert(alert);
+      // ── Intermediate TP crossing (multi-TP, split disabled) ──
+      // Reuses the same entry lookup; derives price once and caches.
+      this.checkIntermediateTpCross(p, entry);
     }
     // Drop alert flags for positions that are no longer open.
     for (const id of Array.from(this.alerted.keys())) {
       if (!seen.has(id)) this.alerted.delete(id);
+    }
+    // Drop partial-TP-hit tracking for positions no longer open.
+    for (const key of Array.from(this.partialTpHit.keys())) {
+      if (!seen.has(key)) this.partialTpHit.delete(key);
     }
   }
 
@@ -1389,68 +1401,56 @@ export class PositionSummaryMonitor {
   }
 
   /**
-   * Check whether an open position's current price has crossed any
-   * intermediate TP targets. Only fires when the slTpStore entry includes
+   * Check whether a single open position's current price has crossed any
+   * intermediate TP target. Only fires when the SlTpEntry includes
    * `allTpTargets` (multi-TP signal placed with splitMultiTp disabled).
    *
-   * For each intermediate TP (all except the last/furthest one), if the
-   * current price has crossed the TP level, the `onPartialTpHit` callback
-   * is invoked exactly once per TP per position lifetime.
+   * Called from {@link checkAlerts} which already resolved the entry
+   * lookup — no extra API calls here.
    */
-  private checkPartialTpHits(active: Position[]): void {
+  private checkIntermediateTpCross(p: Position, entry: SlTpEntry): void {
     if (!this.onPartialTpHit) return;
+    if (!entry.allTpTargets || entry.allTpTargets.length <= 1) return;
 
-    const seen = new Set<string>();
-    for (const p of active) {
-      const key = `${p.symbol}:${p.positionType}`;
-      seen.add(key);
-      const entry = this.slTpStore.get(p.symbol, p.positionType);
-      if (!entry || !entry.allTpTargets || entry.allTpTargets.length <= 1) continue;
+    const allTps = entry.allTpTargets;
+    const isLong = p.positionType === 1;
+    const current = this.deriveCurrentPrice(p);
+    if (!Number.isFinite(current) || current <= 0) return;
 
-      const allTps = entry.allTpTargets;
-      const isLong = p.positionType === 1;
-      const current = this.deriveCurrentPrice(p);
-      if (!Number.isFinite(current) || current <= 0) continue;
+    const key = `${p.symbol}:${p.positionType}`;
+    const hitSet = this.partialTpHit.get(key) ?? new Set<number>();
 
-      const hitSet = this.partialTpHit.get(key) ?? new Set<number>();
+    // Check each intermediate TP (all except the last/furthest one).
+    for (let i = 0; i < allTps.length - 1; i++) {
+      const tpPrice = allTps[i];
+      if (hitSet.has(tpPrice)) continue; // already handled
 
-      // Check each intermediate TP (all except the last/furthest one).
-      for (let i = 0; i < allTps.length - 1; i++) {
-        const tpPrice = allTps[i];
-        if (hitSet.has(tpPrice)) continue; // already handled
+      const crossed = isLong
+        ? current >= tpPrice   // LONG: price rose above TP
+        : current <= tpPrice;  // SHORT: price fell below TP
 
-        const crossed = isLong
-          ? current >= tpPrice   // LONG: price rose above TP
-          : current <= tpPrice;  // SHORT: price fell below TP
+      if (crossed) {
+        hitSet.add(tpPrice);
+        this.partialTpHit.set(key, hitSet);
 
-        if (crossed) {
-          hitSet.add(tpPrice);
-          this.partialTpHit.set(key, hitSet);
+        this.logger.info(
+          `🎯 Intermediate TP hit: ${p.symbol} ${isLong ? "LONG" : "SHORT"} ` +
+          `TP${i + 1}=${tpPrice} crossed (current=${current}), ` +
+          `${allTps.length - i - 1} TP(s) remaining`
+        );
 
-          this.logger.info(
-            `🎯 Intermediate TP hit: ${p.symbol} ${isLong ? "LONG" : "SHORT"} ` +
-            `TP${i + 1}=${tpPrice} crossed (current=${current}), ` +
-            `${allTps.length - i - 1} TP(s) remaining`
-          );
-
-          this.onPartialTpHit({
-            positionId: String(p.positionId),
-            symbol: p.symbol,
-            positionType: p.positionType,
-            tpPrice,
-            currentPrice: current,
-            remainingTpTargets: allTps.slice(i + 1), // TPs still ahead
-            tpIndex: i,
-            totalTpCount: allTps.length,
-            orderId: entry.orderId,
-          });
-        }
+        this.onPartialTpHit({
+          positionId: String(p.positionId),
+          symbol: p.symbol,
+          positionType: p.positionType,
+          tpPrice,
+          currentPrice: current,
+          remainingTpTargets: allTps.slice(i + 1), // TPs still ahead
+          tpIndex: i,
+          totalTpCount: allTps.length,
+          orderId: entry.orderId,
+        });
       }
-    }
-
-    // Clean up hit tracking for positions no longer open.
-    for (const key of Array.from(this.partialTpHit.keys())) {
-      if (!seen.has(key)) this.partialTpHit.delete(key);
     }
   }
 

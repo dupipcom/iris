@@ -1089,38 +1089,82 @@ export class SignalBot {
     );
 
     if (result.success) {
+      const entry = this.slTpStore.get(hit.symbol, hit.positionType);
+
+      // ── Trailing stop: move SL on TP hit ──
+      if (this.config.trailingStopOnTp && entry && entry.allTpTargets) {
+        const originalTps = entry.allTpTargets;
+        let newSl: number | null = null;
+
+        if (hit.tpIndex === 0) {
+          // TP1 hit → move SL to entry price (breakeven)
+          newSl = position.openAvgPrice;
+        } else if (hit.tpIndex > 0 && hit.tpIndex < originalTps.length) {
+          // TP2+ hit → move SL to previous TP level
+          newSl = originalTps[hit.tpIndex - 1];
+        }
+
+        if (newSl !== null && Number.isFinite(newSl) && newSl > 0) {
+          // Approximate remaining volume after partial close.
+          const remainingVol = Math.max(
+            position.holdVol * (1 - closePercent / 100),
+            position.holdVol * 0.01 // safety floor
+          );
+          const updated = await this.executor.updateStopLoss(
+            hit.symbol,
+            Number(hit.positionId),
+            hit.positionType,
+            remainingVol,
+            newSl,
+          );
+          if (updated) {
+            this.logger.info(
+              `🔄 Trailing stop: SL moved to ${newSl} for ${hit.symbol} ` +
+              `(TP${hit.tpIndex + 1} hit → SL=${hit.tpIndex === 0 ? "breakeven" : `TP${hit.tpIndex}`})`
+            );
+          }
+        }
+      }
+
       // Update slTpStore: remove the hit TP from the list.
       // The remaining TPs are the ones still ahead (higher indices).
-      const entry = this.slTpStore.get(hit.symbol, hit.positionType);
       if (entry && entry.allTpTargets) {
         const remaining = entry.allTpTargets.slice(hit.tpIndex + 1);
+        // Compute updated SL: if trailing stop moved it, use the new value;
+        // otherwise keep the original SL.
+        const updatedSl = this.config.trailingStopOnTp && hit.tpIndex === 0
+          ? position.openAvgPrice  // breakeven
+          : this.config.trailingStopOnTp && hit.tpIndex > 0
+            ? entry.allTpTargets[hit.tpIndex - 1]  // previous TP
+            : entry.sl;
+
         if (remaining.length > 0) {
           // Update store with remaining TPs. The furthest remaining TP
           // becomes the new primary TP for alert calculations.
           const furthestRemaining = remaining[remaining.length - 1];
           this.slTpStore.set(hit.symbol, hit.positionType, {
-            sl: entry.sl,
+            sl: updatedSl,
             tp: furthestRemaining,
             setAt: Date.now(),
             orderId: entry.orderId,
             allTpTargets: remaining.length > 1 ? remaining : undefined,
           });
           this.logger.info(
-            `💾 SL/TP updated for ${hit.symbol}: TP now ${furthestRemaining}, ` +
+            `💾 SL/TP updated for ${hit.symbol}: SL=${updatedSl} TP=${furthestRemaining}, ` +
             `${remaining.length} TP(s) remaining`
           );
         } else {
           // Only the furthest TP remains — no more partial closes needed.
           // Keep the entry but clear allTpTargets since there's only 1 TP left.
           this.slTpStore.set(hit.symbol, hit.positionType, {
-            sl: entry.sl,
+            sl: updatedSl,
             tp: entry.tp,
             setAt: Date.now(),
             orderId: entry.orderId,
             allTpTargets: undefined,
           });
           this.logger.info(
-            `💾 SL/TP updated for ${hit.symbol}: only furthest TP=${entry.tp} remains`
+            `💾 SL/TP updated for ${hit.symbol}: SL=${updatedSl} TP=${entry.tp} (only furthest remains)`
           );
         }
       }

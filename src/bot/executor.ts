@@ -842,6 +842,42 @@ export class TradeExecutor {
     return false;
   }
 
+  /**
+   * Update only the stop-loss for an open position by placing a new stop
+   * order with just the SL side. MEXC replaces any existing SL for the
+   * position automatically — no need to cancel first.
+   *
+   * Used by trailing-stop-on-TP: when an intermediate TP is hit, the SL
+   * moves to break-even (TP1 hit) or the previous TP level (TP2+ hit).
+   *
+   * @returns true if the stop order was placed successfully.
+   */
+  async updateStopLoss(
+    symbol: string,
+    positionId: number | string,
+    positionType: 1 | 2,
+    vol: number,
+    newSl: number,
+  ): Promise<boolean> {
+    const lossTrend: 1 = 1; // latest price trigger
+    this.logger.info(
+      `🔄 Updating SL for ${symbol} ${positionType === 1 ? "LONG" : "SHORT"} posId=${positionId} vol=${vol} → new SL=${newSl}`
+    );
+
+    // Place a new stop order with only the SL side — MEXC replaces any
+    // existing SL for this position automatically.
+    return this.placeStopOrder(
+      {
+        symbol,
+        positionId,
+        vol,
+        lossTrend,
+        stopLossPrice: newSl,
+      },
+      `Trailing SL update (${newSl})`
+    );
+  }
+
   /** Convert a successful/failed API response to a TradeRecord. */
   private toTradeRecord(
     trade: ResolvedTrade,

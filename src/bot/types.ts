@@ -229,6 +229,15 @@ export interface BotConfig {
    * Set via TP_DISTRIBUTION env var (comma-separated, e.g. "60,30,10").
    */
   tpDistribution: number[];
+
+  /**
+   * When true and splitMultiTp is disabled, the stop-loss trails behind
+   * each hit TP: TP1 hit → SL moves to entry (breakeven), TP2 hit → SL
+   * moves to TP1, etc. Requires splitMultiTp=false (partial-close mode).
+   *
+   * Set via TRAILING_STOP_ON_TP env var ("true"/"1" to enable, default false).
+   */
+  trailingStopOnTp: boolean;
 }
 
 /**
