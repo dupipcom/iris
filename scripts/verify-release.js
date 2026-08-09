@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
  * Verify that every release metadata file (latest*.yml) in the release output
- * matches the actual build artifacts on disk (sha512 + size).
+ * matches the actual build artifacts on disk (sha512 + size + blockmap size).
+ *
+ * Parses with js-yaml (not line regexes) so folded/wrapped sha512 lines that
+ * electron-builder emits are handled correctly.
  *
  * electron-updater trusts the checksums published in these yml files. If an
  * installer is rebuilt / re-signed after the yml was generated (or the two are
@@ -15,6 +18,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const yaml = require("js-yaml");
 
 const dir = path.resolve(process.argv[2] || "release");
 if (!fs.existsSync(dir)) {
@@ -40,49 +44,50 @@ if (metas.length === 0) {
   process.exit(2);
 }
 
-for (const meta of metas) {
-  const text = fs.readFileSync(path.join(dir, meta), "utf8");
+function checkEntry(label, artifact, ymlSha, ymlSize, ymlBlockMapSize, checkBlockMap = true) {
+  if (!fs.existsSync(artifact)) {
+    console.error(`❌ [${label}] missing artifact: ${artifact}`);
+    failures++;
+    return;
+  }
+  const actualHash = sha512Base64(artifact);
+  const actualSize = fs.statSync(artifact).size;
+  const bmPath = artifact + ".blockmap";
+  const actualBlockMapSize = fs.existsSync(bmPath) ? fs.statSync(bmPath).size : undefined;
 
-  // Parse the `files:` entries: `- url:`, `sha512:`, `size:` blocks.
-  const entries = [];
-  let cur = null;
-  for (const line of text.split("\n")) {
-    const url = line.match(/^\s*-\s+url:\s*(.+)$/);
-    const sha = line.match(/^\s*sha512:\s*(.+)$/);
-    const size = line.match(/^\s*size:\s*(\d+)$/);
-    if (url) {
-      cur = { url: url[1].trim() };
-      entries.push(cur);
-    } else if (sha && cur) {
-      cur.sha512 = sha[1].trim();
-    } else if (size && cur) {
-      cur.size = Number(size[1]);
-    }
+  const shaOk = actualHash === ymlSha;
+  const sizeOk = actualSize === ymlSize;
+  const bmOk = !checkBlockMap || (ymlBlockMapSize ?? undefined) === actualBlockMapSize;
+
+  if (shaOk && sizeOk && bmOk) {
+    console.log(`✅ [${label}] ${path.basename(artifact)}`);
+    return;
   }
 
-  for (const entry of entries) {
-    const artifact = path.join(dir, entry.url);
-    if (!fs.existsSync(artifact)) {
-      console.error(`❌ [${meta}] missing artifact: ${entry.url}`);
-      failures++;
-      continue;
-    }
-    const actualHash = sha512Base64(artifact);
-    const actualSize = fs.statSync(artifact).size;
-    if (actualHash === entry.sha512 && actualSize === entry.size) {
-      console.log(`✅ [${meta}] ${entry.url}`);
-    } else {
-      console.error(`❌ [${meta}] ${entry.url}`);
-      if (actualHash !== entry.sha512) {
-        console.error(`   sha512 expected: ${entry.sha512}`);
-        console.error(`   sha512 actual:   ${actualHash}`);
-      }
-      if (actualSize !== entry.size) {
-        console.error(`   size   expected: ${entry.size}`);
-        console.error(`   size   actual:   ${actualSize}`);
-      }
-      failures++;
-    }
+  console.error(`❌ [${label}] ${path.basename(artifact)}`);
+  if (!shaOk) {
+    console.error(`   sha512 yml: ${ymlSha}`);
+    console.error(`   sha512 now: ${actualHash}`);
+  }
+  if (!sizeOk) {
+    console.error(`   size   yml: ${ymlSize}`);
+    console.error(`   size   now: ${actualSize}`);
+  }
+  if (!bmOk) {
+    console.error(`   blockMapSize yml: ${ymlBlockMapSize}`);
+    console.error(`   blockMapSize now: ${actualBlockMapSize}`);
+  }
+  failures++;
+}
+
+for (const meta of metas) {
+  const data = yaml.load(fs.readFileSync(path.join(dir, meta), "utf8"));
+  for (const entry of data.files || []) {
+    checkEntry(meta, path.join(dir, entry.url), entry.sha512, entry.size, entry.blockMapSize);
+  }
+  if (data.path) {
+    // Top-level entries don't carry a blockmap size; only check sha512 + size.
+    checkEntry(`${meta} (path)`, path.join(dir, data.path), data.sha512, data.size, undefined, false);
   }
 }
 

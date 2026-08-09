@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 /**
- * Regenerate SHA512 checksums and sizes in all latest*.yml files from the
- * actual binary artifacts on disk. Use this when the yml files got out of
- * sync with the installers (e.g. after a cross-platform rebuild).
+ * Regenerate SHA512 checksums, sizes and blockmap sizes in all latest*.yml
+ * files from the actual binary artifacts on disk. Use this when the yml files
+ * got out of sync with the installers (e.g. after a cross-platform rebuild or
+ * a re-sign).
+ *
+ * Parses with js-yaml (not regex) so the folded/wrapped sha512 lines that
+ * electron-builder emits are handled correctly.
  *
  * Usage: node scripts/fix-release-checksums.js [release-dir]
  * Defaults to ./release.
@@ -12,6 +16,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const yaml = require("js-yaml");
 
 const dir = path.resolve(process.argv[2] || "release");
 if (!fs.existsSync(dir)) {
@@ -26,6 +31,12 @@ function sha512Base64(file) {
     .digest("base64");
 }
 
+/** Size in bytes of the sidecar .blockmap for an artifact, or undefined. */
+function blockMapSizeFor(artifact) {
+  const bm = artifact + ".blockmap";
+  return fs.existsSync(bm) ? fs.statSync(bm).size : undefined;
+}
+
 const yamlFiles = fs
   .readdirSync(dir)
   .filter((f) => /^latest.*\.yml$/.test(f))
@@ -36,87 +47,86 @@ if (yamlFiles.length === 0) {
   process.exit(2);
 }
 
-let fixed = 0;
-let skipped = 0;
-let missing = 0;
+let totalFixed = 0;
+let totalCorrect = 0;
+let totalMissing = 0;
 
 for (const meta of yamlFiles) {
   const metaPath = path.join(dir, meta);
-  let text = fs.readFileSync(metaPath, "utf8");
-  let changed = false;
+  const data = yaml.load(fs.readFileSync(metaPath, "utf8"));
+  let fixed = 0;
+  let correct = 0;
+  let missing = 0;
 
-  // Find the top-level path entry.
-  const topPathMatch = text.match(/^path:\s*(.+)$/m);
-  const topPath = topPathMatch ? topPathMatch[1].trim() : null;
-
-  // Parse all file entries: `  - url:` blocks with `sha512:` and `size:`.
-  const filePattern =
-    /( {2}- url:\s*(.+)\n(?: {4}sha512:\s*(.+)\n)?(?: {4}size:\s*(\d+)\n)?(?: {4}blockMapSize:\s*(\d+)\n)?)/g;
-
-  text = text.replace(filePattern, (match, fullLine, url, oldSha, oldSize, oldBlockMapSize) => {
-    const artifact = path.join(dir, url.trim());
+  // Fix every `files:` entry.
+  for (const entry of data.files || []) {
+    const artifact = path.join(dir, entry.url);
     if (!fs.existsSync(artifact)) {
-      console.error(`⚠️  [${meta}] Missing artifact, skipping: ${url.trim()}`);
+      console.error(`⚠️  [${meta}] Missing artifact, leaving entry unchanged: ${entry.url}`);
       missing++;
-      return match; // keep original entry unchanged
+      continue;
     }
 
     const actualSha = sha512Base64(artifact);
     const actualSize = fs.statSync(artifact).size;
+    const actualBlockMapSize = blockMapSizeFor(artifact);
 
-    // Check blockmap
-    let actualBlockMapSize = null;
-    const blockmapPath = artifact + ".blockmap";
-    if (fs.existsSync(blockmapPath)) {
-      actualBlockMapSize = fs.statSync(blockmapPath).size;
-    }
-
-    if (actualSha === (oldSha || "").trim() && String(actualSize) === (oldSize || "").trim()) {
-      skipped++;
-      return match;
+    if (
+      entry.sha512 === actualSha &&
+      entry.size === actualSize &&
+      entry.blockMapSize === actualBlockMapSize
+    ) {
+      correct++;
+      continue;
     }
 
     fixed++;
-    console.log(`🔧 [${meta}] ${url.trim()}`);
-
-    let entry = `  - url: ${url.trim()}\n`;
-    entry += `    sha512: ${actualSha}\n`;
-    entry += `    size: ${actualSize}`;
-    if (actualBlockMapSize !== null) {
-      entry += `\n    blockMapSize: ${actualBlockMapSize}`;
+    console.log(`🔧 [${meta}] ${entry.url}`);
+    entry.sha512 = actualSha;
+    entry.size = actualSize;
+    if (actualBlockMapSize !== undefined) {
+      entry.blockMapSize = actualBlockMapSize;
+    } else {
+      delete entry.blockMapSize; // no local blockmap → don't advertise one
     }
-    entry += "\n";
-    return entry;
-  });
+  }
 
-  // Fix the top-level path/sha512/size if they reference an artifact that
-  // exists and whose checksum we just updated.
-  if (topPath) {
-    const topArtifact = path.join(dir, topPath);
+  // Fix the top-level path/sha512/size (the "default" artifact).
+  if (data.path) {
+    const topArtifact = path.join(dir, data.path);
     if (fs.existsSync(topArtifact)) {
       const actualSha = sha512Base64(topArtifact);
       const actualSize = fs.statSync(topArtifact).size;
-      // Replace top-level sha512 line
-      text = text.replace(/^sha512:\s*.+$/m, `sha512: ${actualSha}`);
-      // Replace top-level size line if present
-      if (/^size:\s*\d+$/m.test(text)) {
-        text = text.replace(/^size:\s*\d+$/m, `size: ${actualSize}`);
+      if (data.sha512 !== actualSha || data.size !== actualSize) {
+        fixed++;
+        console.log(`🔧 [${meta}] top-level ${data.path}`);
+        data.sha512 = actualSha;
+        data.size = actualSize;
+      } else {
+        correct++;
       }
+    } else {
+      missing++;
     }
   }
 
-  if (changed || fixed > skipped) {
-    fs.writeFileSync(metaPath, text, "utf8");
-    console.log(`✅ [${meta}] written with ${fixed} fix(es)`);
-  }
+  // Write back. lineWidth: -1 keeps long base64 hashes on one line (valid YAML).
+  fs.writeFileSync(metaPath, yaml.dump(data, { lineWidth: -1 }), "utf8");
+  console.log(
+    `✅ [${meta}] ${fixed ? `fixed ${fixed}` : "no changes"}, ${correct} already correct, ${missing} missing`
+  );
+
+  totalFixed += fixed;
+  totalCorrect += correct;
+  totalMissing += missing;
 }
 
 console.log(
-  `\n📊 Summary: ${fixed} fixed, ${skipped} already correct, ${missing} missing artifacts`
+  `\n📊 Summary: ${totalFixed} fixed, ${totalCorrect} already correct, ${totalMissing} missing artifacts`
 );
-if (missing > 0) {
+if (totalMissing > 0) {
   console.warn("⚠️  Missing artifacts were left unchanged in the yml files.");
 }
-if (fixed === 0 && missing === 0) {
+if (totalFixed === 0 && totalMissing === 0) {
   console.log("✅ All checksums already match the artifacts.");
 }
