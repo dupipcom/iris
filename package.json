@@ -1,6 +1,6 @@
 {
   "name": "dpip-invest-connector",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "description": "Dupip Invest Connector — MEXC Futures Telegram Signal Bot. Automates futures trading by listening for trade signals on Telegram channels and executing them on MEXC.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
